@@ -146,6 +146,17 @@ async def poll_device_token(nonce, verifier, timeout_sec=180, email=""):
     return None
 
 
+# ── Dialog auto-dismiss helper ───────────────────────────────────────
+async def _auto_dismiss(dialog, email=""):
+    """Auto-dismiss any browser dialog (alert, confirm, prompt, beforeunload)."""
+    try:
+        msg = dialog.message[:80] if dialog.message else ""
+        dbg(f"[{email}] Dialog dismissed ({dialog.type}): {msg}")
+        await dialog.dismiss()
+    except Exception as e:
+        dbg(f"[{email}] Dialog dismiss error: {e}")
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  Phase 2 — Browser Automation
 # ══════════════════════════════════════════════════════════════════════
@@ -165,7 +176,15 @@ async def automate_login(email, password, nonce, code_challenge, machine_id):
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=HEADLESS,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                # Block "X wants to access your local network" prompt
+                "--disable-features=PrivateNetworkAccessRespectPreflightResults,"
+                    "PrivateNetworkAccessSendPreflights,"
+                    "BlockInsecurePrivateNetworkRequests,"
+                    "PrivateNetworkAccessPromptForUnsureBlocked",
+            ],
         )
         ctx = await browser.new_context(
             viewport={"width": 500, "height": 700},
@@ -175,7 +194,36 @@ async def automate_login(email, password, nonce, code_challenge, machine_id):
         await ctx.add_init_script(
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
         )
+
+        # ── Block private/local network requests at network level ──
+        _PRIVATE_PREFIXES = (
+            "0.", "10.", "127.", "169.254.", "172.16.", "172.17.", "172.18.",
+            "172.19.", "172.20.", "172.21.", "172.22.", "172.23.", "172.24.",
+            "172.25.", "172.26.", "172.27.", "172.28.", "172.29.", "172.30.",
+            "172.31.", "192.168.", "localhost", "[::1]", "[::]",
+        )
+
+        async def _block_private(route):
+            url = route.request.url
+            try:
+                from urllib.parse import urlparse
+                host = urlparse(url).hostname or ""
+            except:
+                host = ""
+            if host and any(host.startswith(p) or host == p.rstrip(".") for p in _PRIVATE_PREFIXES):
+                dbg(f"[BLOCK] Private network request: {url[:80]}")
+                await route.abort("blockedbyclient")
+            else:
+                await route.continue_()
+
         page = await ctx.new_page()
+
+        # ── Auto-dismiss ALL browser dialogs (alert, confirm, prompt, beforeunload) ──
+        page.on("dialog", lambda d: asyncio.ensure_future(_auto_dismiss(d, email)))
+
+        # ── Intercept private network requests ──
+        await page.route("**/*", _block_private)
+
         page.set_default_timeout(30000)
 
         state = {"login_done": False, "error": None}
@@ -187,27 +235,31 @@ async def automate_login(email, password, nonce, code_challenge, machine_id):
             log(f"[{email}] Page: {url[:80]}...")
 
             if "sign-in" in url or "users" in url:
-                await _handle_signin_page(page, email, password)
+                sso_found = await _handle_signin_page(page, email, password)
 
-                for i in range(90):
-                    await asyncio.sleep(1)
-                    try: url = page.url
-                    except: break
+                if not sso_found:
+                    log(f"[{email}] Aborting — Google SSO not available", "ERR")
+                    state["error"] = "google_sso_not_found"
+                else:
+                    for i in range(90):
+                        await asyncio.sleep(1)
+                        try: url = page.url
+                        except: break
 
-                    if "selectAccounts" in url:
-                        log(f"[{email}] Redirected to selectAccounts!", "OK")
-                        await _handle_select_accounts(page)
-                        state["login_done"] = True
-                        break
-                    if any(x in url for x in ("callback","success","authorized")):
-                        log(f"[{email}] Login successful!", "OK")
-                        state["login_done"] = True
-                        break
-                    if "sign-in" in url and i > 15:
-                        err = await _get_page_error(page)
-                        if err:
-                            log(f"[{email}] Page error: {err}", "ERR")
-                            state["error"] = err
+                        if "selectAccounts" in url:
+                            log(f"[{email}] Redirected to selectAccounts!", "OK")
+                            await _handle_select_accounts(page)
+                            state["login_done"] = True
+                            break
+                        if any(x in url for x in ("callback","success","authorized")):
+                            log(f"[{email}] Login successful!", "OK")
+                            state["login_done"] = True
+                            break
+                        if "sign-in" in url and i > 15:
+                            err = await _get_page_error(page)
+                            if err:
+                                log(f"[{email}] Page error: {err}", "ERR")
+                                state["error"] = err
 
             elif "selectAccounts" in url:
                 await _handle_select_accounts(page)
@@ -230,16 +282,38 @@ async def automate_login(email, password, nonce, code_challenge, machine_id):
 
 # ── Sign-in dispatcher ────────────────────────────────────────────────
 async def _handle_signin_page(page, email, password):
+    """Returns True if Google SSO was found and clicked, False otherwise."""
     log(f"[{email}] Detecting login method...")
-    await asyncio.sleep(2)
+    # Wait longer for page render (headless can be slower)
+    await asyncio.sleep(3)
 
-    if await _try_google_sso(page):
-        log(f"[{email}] Google SSO detected. Handling Google login...", "OK")
-        await _handle_google_login(page, email, password)
-        return
+    # Retry Google SSO detection multiple times (headless may need more time)
+    for attempt in range(5):
+        if attempt > 0:
+            dbg(f"[{email}] Google SSO retry #{attempt+1}...")
+            await asyncio.sleep(2)
 
-    log(f"[{email}] Google SSO not found. Using direct email/password...")
-    await _handle_qoder_password_login(page, email, password)
+        if await _try_google_sso(page):
+            log(f"[{email}] Google SSO detected. Handling Google login...", "OK")
+            await _handle_google_login(page, email, password)
+            return True
+
+    # Qoder ONLY supports Google SSO — no direct email/password fallback
+    log(f"[{email}] Google SSO button NOT found after 5 attempts!", "ERR")
+    log(f"[{email}] Qoder only supports Google SSO login.", "ERR")
+    # Try to get page info for debugging
+    try:
+        title = await page.title()
+        url = page.url
+        dbg(f"[{email}] Page title: {title}, URL: {url[:100]}")
+        # Screenshot for debugging headless issues
+        if HEADLESS:
+            ss_path = f"debug_sso_{email.split('@')[0]}.png"
+            await page.screenshot(path=ss_path)
+            dbg(f"[{email}] Debug screenshot saved: {ss_path}")
+    except:
+        pass
+    return False
 
 
 # ── Google SSO ────────────────────────────────────────────────────────
@@ -249,28 +323,53 @@ async def _try_google_sso(page):
         '[class*="google" i]', 'button:has-text("Sign in with Google")',
         'a:has-text("Sign in with Google")', 'button[data-provider="google"]',
         '[aria-label*="Google" i]', 'img[alt*="Google" i]',
+        'div:has-text("Google")', '[href*="google"]',
+        'button:has-text("google")', 'a:has-text("google")',
+        'span:has-text("Google")', 'span:has-text("google")',
     ]
     for sel in google_selectors:
         try:
             el = page.locator(sel).first
-            if await el.is_visible(timeout=1500):
-                await el.click()
+            if await el.is_visible(timeout=2000):
+                await el.click(force=True)
                 dbg(f"Google SSO clicked via: {sel}")
                 await asyncio.sleep(3)
                 return True
         except:
             continue
+    # JS fallback — search all clickable elements for "google" text
     try:
         clicked = await page.evaluate("""() => {
-            const els = document.querySelectorAll('button, a, div[role="button"]');
+            const els = document.querySelectorAll(
+                'button, a, div[role="button"], span[role="button"], ' +
+                '[onclick], [class*="btn"], [class*="button"], [class*="social"], ' +
+                '[class*="oauth"], [class*="provider"], [class*="sso"]'
+            );
             for (const el of els) {
-                if (el.textContent && el.textContent.toLowerCase().includes('google')) {
-                    el.click(); return true;
+                const txt = (el.textContent || el.innerText || el.getAttribute('aria-label') || '').toLowerCase();
+                if (txt.includes('google')) {
+                    // Scroll into view first (helps headless)
+                    el.scrollIntoView({block: 'center'});
+                    el.click();
+                    return 'clicked: ' + (el.tagName + ':' + txt.trim().substring(0, 30));
                 }
             }
-            return false;
+            // Also check images with Google-related alt/src
+            const imgs = document.querySelectorAll('img');
+            for (const img of imgs) {
+                const alt = (img.alt || '').toLowerCase();
+                const src = (img.src || '').toLowerCase();
+                if (alt.includes('google') || src.includes('google')) {
+                    const parent = img.closest('button, a, [role="button"]') || img;
+                    parent.scrollIntoView({block: 'center'});
+                    parent.click();
+                    return 'clicked img: ' + alt.substring(0, 30);
+                }
+            }
+            return null;
         }""")
         if clicked:
+            dbg(f"Google SSO JS fallback: {clicked}")
             await asyncio.sleep(3)
             return True
     except:

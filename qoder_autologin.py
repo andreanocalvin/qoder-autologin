@@ -54,7 +54,13 @@ DEBUG_ENABLED = False
 def log(msg, level="INFO"):
     ts = datetime.now().strftime("%H:%M:%S")
     pfx = {"INFO":"ℹ","OK":"✅","ERR":"❌","DBG":"🔍","WAIT":"⏳","SUM":"📊"}.get(level," ")
-    print(f"[{ts}] {pfx} {msg}", flush=True)
+    text = f"[{ts}] {pfx} {msg}"
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        # Fallback for Windows cmd that doesn't support Unicode emojis
+        pfx_ascii = {"INFO":"[i]","OK":"[+]","ERR":"[!]","DBG":"[*]","WAIT":"[~]","SUM":"[=]"}.get(level," ")
+        print(f"[{ts}] {pfx_ascii} {msg}", flush=True)
 
 def dbg(msg):
     if DEBUG_ENABLED: log(msg, "DBG")
@@ -218,52 +224,57 @@ async def automate_login(email, password, nonce, code_challenge, machine_id):
         browser = await p.chromium.launch(
             headless=HEADLESS,
             args=[
+                # ── Anti-detection flags ──
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-infobars",
                 # Block "X wants to access your local network" prompt
                 "--disable-features=PrivateNetworkAccessRespectPreflightResults,"
                     "PrivateNetworkAccessSendPreflights,"
                     "BlockInsecurePrivateNetworkRequests,"
-                    "PrivateNetworkAccessPromptForUnsureBlocked",
+                    "PrivateNetworkAccessPromptForUnsureBlocked,"
+                    "TranslateUI,OptimizationHints",
             ],
         )
         ctx = await browser.new_context(
-            viewport={"width": 500, "height": 700},
+            viewport={"width": 1280, "height": 800},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
         )
-        await ctx.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-        )
-
-        # ── Block private/local network requests at network level ──
-        _PRIVATE_PREFIXES = (
-            "0.", "10.", "127.", "169.254.", "172.16.", "172.17.", "172.18.",
-            "172.19.", "172.20.", "172.21.", "172.22.", "172.23.", "172.24.",
-            "172.25.", "172.26.", "172.27.", "172.28.", "172.29.", "172.30.",
-            "172.31.", "192.168.", "localhost", "[::1]", "[::]",
-        )
-
-        async def _block_private(route):
-            url = route.request.url
-            try:
-                from urllib.parse import urlparse
-                host = urlparse(url).hostname or ""
-            except:
-                host = ""
-            if host and any(host.startswith(p) or host == p.rstrip(".") for p in _PRIVATE_PREFIXES):
-                dbg(f"[BLOCK] Private network request: {url[:80]}")
-                await route.abort("blockedbyclient")
-            else:
-                await route.continue_()
+        # ── Stealth script: hide Playwright fingerprints ──
+        await ctx.add_init_script("""
+            // Hide webdriver property
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            // Fake plugins (real Chrome has at least one)
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5],
+            });
+            // Fake languages
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en'],
+            });
+            // Chrome runtime
+            window.chrome = { runtime: {} };
+            // Permissions API
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) =>
+                parameters.name === 'notifications'
+                    ? Promise.resolve({state: Notification.permission})
+                    : originalQuery(parameters);
+            // WebGL vendor
+            const getParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                if (parameter === 37445) return 'Intel Inc.';
+                if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+                return getParameter.apply(this, arguments);
+            };
+        """)
 
         page = await ctx.new_page()
 
         # ── Auto-dismiss ALL browser dialogs (alert, confirm, prompt, beforeunload) ──
         page.on("dialog", lambda d: asyncio.ensure_future(_auto_dismiss(d, email)))
-
-        # ── Intercept private network requests ──
-        await page.route("**/*", _block_private)
 
         page.set_default_timeout(30000)
 

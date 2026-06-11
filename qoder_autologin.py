@@ -53,8 +53,13 @@ DEBUG_ENABLED = False
 
 def log(msg, level="INFO"):
     ts = datetime.now().strftime("%H:%M:%S")
-    pfx = {"INFO":"ℹ","OK":"✅","ERR":"❌","DBG":"🔍","WAIT":"⏳","SUM":"📊"}.get(level," ")
-    print(f"[{ts}] {pfx} {msg}", flush=True)
+    pfx = {"INFO":"[i]","OK":"[+]","ERR":"[!]","DBG":"[*]","WAIT":"[~]","SUM":"[=]"}.get(level," ")
+    text = f"[{ts}] {pfx} {msg}"
+    # Gracefully handle Windows consoles that don't support Unicode
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        print(text.encode("ascii", errors="replace").decode("ascii"), flush=True)
 
 def dbg(msg):
     if DEBUG_ENABLED: log(msg, "DBG")
@@ -63,6 +68,45 @@ def dbg(msg):
 # ══════════════════════════════════════════════════════════════════════
 #  PKCE / helpers
 # ══════════════════════════════════════════════════════════════════════
+# ── Google OAuth state detection ─────────────────────────────────────
+async def _google_auth_state(page):
+    """Detect current Google OAuth page state. Returns: email, password, consent,
+    challenge, account_not_found, email_error, select_account, left_google, or unknown."""
+    try:
+        result = await page.evaluate("""() => {
+            const host = window.location.host || '';
+            const path = window.location.pathname || '';
+            const visible = (selectors) => selectors.some((sel) =>
+                Array.from(document.querySelectorAll(sel)).some((el) =>
+                    el.offsetParent !== null && el.offsetWidth > 0 && el.offsetHeight > 0
+                )
+            );
+            const text = (document.body && document.body.innerText || '').toLowerCase();
+            if (!host.includes('accounts.google.com')) return 'left_google';
+            if (text.includes("couldn't find") || text.includes('could not find')) return 'account_not_found';
+            if (text.includes('enter a valid email') || text.includes("couldn't sign in")) return 'email_error';
+            if (path.includes('/signin/v2/challenge/') && !path.includes('/challenge/pwd')) return 'challenge';
+            const challengeMarkers = ['captcha', 'try again later', 'unusual traffic',
+                'this browser or app may not be secure', 'verify it'];
+            if (challengeMarkers.some((m) => text.includes(m))) return 'challenge';
+            if (visible(['input[name="Passwd"]', 'input[type="password"]'])) return 'password';
+            if (visible(['#identifierId', 'input[type="email"]'])) return 'email';
+            if (visible(['[data-identifier]', '[data-email]'])) return 'select_account';
+            const consentButtons = [...document.querySelectorAll('button, [role="button"]')];
+            const hasConsent = consentButtons.some(b => {
+                const t = (b.textContent || '').toLowerCase();
+                return t.includes('continue') || t.includes('allow') || t.includes('i understand') ||
+                    t.includes('agree') || t.includes('accept') || t.includes('confirm') ||
+                    t.includes('approve') || t.includes('grant');
+            });
+            if (hasConsent) return 'consent';
+            return 'transition';
+        }""")
+        return str(result) if result else "unknown"
+    except:
+        return "unknown"
+
+
 def generate_pkce_pair():
     verifier = secrets.token_urlsafe(32)
     digest = hashlib.sha256(verifier.encode("ascii")).digest()
@@ -182,52 +226,180 @@ async def automate_login(email, password, nonce, code_challenge, machine_id):
         browser = await p.chromium.launch(
             headless=HEADLESS,
             args=[
+                # ── Anti-detection flags ──
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-infobars",
+                "--disable-features=IsolateOrigins,site-per-process",
                 # Block "X wants to access your local network" prompt
                 "--disable-features=PrivateNetworkAccessRespectPreflightResults,"
                     "PrivateNetworkAccessSendPreflights,"
                     "BlockInsecurePrivateNetworkRequests,"
                     "PrivateNetworkAccessPromptForUnsureBlocked",
+                # Reduce fingerprinting surface
+                "--disable-features=TranslateUI",
+                "--disable-features=OptimizationHints",
+                "--disable-features=MediaRouter",
+                "--disable-features=DialMediaRouteProvider",
+                "--disable-component-extensions-with-background-pages",
+                "--disable-ipc-flooding-protection",
+                "--disable-default-apps",
+                "--disable-breakpad",
+                "--disable-sync",
+                "--disable-client-side-phishing-detection",
+                "--disable-component-update",
+                "--disable-domain-reliability",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--mute-audio",
+                "--disable-background-networking",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-hang-monitor",
+                "--disable-prompt-on-repost",
+                "--disable-renderer-backgrounding",
+                "--enable-features=NetworkService,NetworkServiceInProcess",
+                "--force-color-profile=srgb",
+                "--metrics-recording-only",
+                "--password-store=basic",
+                "--use-mock-keychain",
             ],
         )
         ctx = await browser.new_context(
-            viewport={"width": 500, "height": 700},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-        )
-        await ctx.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-        )
-
-        # ── Block private/local network requests at network level ──
-        _PRIVATE_PREFIXES = (
-            "0.", "10.", "127.", "169.254.", "172.16.", "172.17.", "172.18.",
-            "172.19.", "172.20.", "172.21.", "172.22.", "172.23.", "172.24.",
-            "172.25.", "172.26.", "172.27.", "172.28.", "172.29.", "172.30.",
-            "172.31.", "192.168.", "localhost", "[::1]", "[::]",
+            viewport={"width": 1280, "height": 800},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+            timezone_id="Asia/Jakarta",
+            permissions=["geolocation"],
+            geolocation={"latitude": -6.2088, "longitude": 106.8456},
+            color_scheme="light",
         )
 
-        async def _block_private(route):
-            url = route.request.url
-            try:
-                from urllib.parse import urlparse
-                host = urlparse(url).hostname or ""
-            except:
-                host = ""
-            if host and any(host.startswith(p) or host == p.rstrip(".") for p in _PRIVATE_PREFIXES):
-                dbg(f"[BLOCK] Private network request: {url[:80]}")
-                await route.abort("blockedbyclient")
-            else:
-                await route.continue_()
+        # ── Comprehensive stealth init script ──
+        await ctx.add_init_script("""
+            // 1. Hide webdriver (PLAYWRIGHT DEFAULT OVERRIDE)
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+            // 2. Fake plugins (empty plugins = 100% bot signal)
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => {
+                    const arr = [1, 2, 3, 4, 5];
+                    arr.item = (i) => arr[i] || null;
+                    arr.namedItem = (name) => null;
+                    arr.refresh = () => {};
+                    return arr;
+                }
+            });
+            Object.defineProperty(navigator, 'mimeTypes', {
+                get: () => {
+                    const arr = [1, 2, 3];
+                    arr.item = (i) => arr[i] || null;
+                    arr.namedItem = (name) => null;
+                    return arr;
+                }
+            });
+
+            // 3. Fix navigator.languages
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en', 'id']
+            });
+
+            // 4. Create window.chrome (real Chrome always has this)
+            window.chrome = {
+                runtime: {},
+                loadTimes: function() {},
+                csi: function() {},
+                app: {}
+            };
+
+            // 5. Fix permissions API behavior
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({state: Notification.permission, onchange: null}) :
+                    originalQuery(parameters)
+            );
+
+            // 6. Fix Notification.permission
+            Object.defineProperty(Notification, 'permission', {
+                get: () => 'default'
+            });
+
+            // 7. Override navigator.vendor
+            Object.defineProperty(navigator, 'vendor', {
+                get: () => 'Google Inc.'
+            });
+
+            // 8. Override hardwareConcurrency if too low
+            if (navigator.hardwareConcurrency < 4) {
+                Object.defineProperty(navigator, 'hardwareConcurrency', {
+                    get: () => 4
+                });
+            }
+
+            // 9. Fix Intl.DateTimeFormat (some bot detectors check this)
+            const originalDateTimeFormat = Intl.DateTimeFormat;
+            // Ensure formatToParts exists (missing in some headless)
+            if (!Intl.DateTimeFormat.prototype.formatToParts) {
+                Intl.DateTimeFormat.prototype.formatToParts = function(date) {
+                    return [{type: 'literal', value: this.format(date)}];
+                };
+            }
+
+            // 10. Fix WebGL vendor (headless returns "Google Inc." but with empty renderer)
+            const getParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                if (parameter === 37445) { // UNMASKED_VENDOR_WEBGL
+                    return 'Intel Inc.';
+                }
+                if (parameter === 37446) { // UNMASKED_RENDERER_WEBGL
+                    return 'Intel Iris OpenGL Engine';
+                }
+                return getParameter.call(this, parameter);
+            };
+
+            // 11. Fix screen dimensions
+            Object.defineProperty(screen, 'availWidth', { get: () => screen.width });
+            Object.defineProperty(screen, 'availHeight', { get: () => screen.height });
+            Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
+            Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
+
+            // 12. Remove "HeadlessChrome" from userAgent (belt and suspenders)
+            Object.defineProperty(navigator, 'userAgent', {
+                get: () => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
+            });
+
+            // 13. Fix media devices (empty = bot)
+            if (!navigator.mediaDevices) {
+                Object.defineProperty(navigator, 'mediaDevices', {
+                    get: () => ({
+                        enumerateDevices: () => Promise.resolve([
+                            {kind: 'audioinput', deviceId: '', groupId: '', label: ''},
+                            {kind: 'videoinput', deviceId: '', groupId: '', label: ''},
+                            {kind: 'audiooutput', deviceId: '', groupId: '', label: ''}
+                        ]),
+                        getUserMedia: () => Promise.reject(new Error('NotAllowedError'))
+                    })
+                });
+            }
+
+            // 14. Remove Playwright-specific properties
+            delete window.__playwright__binding__;
+            delete window.__pwInitScripts;
+        """)
 
         page = await ctx.new_page()
 
         # ── Auto-dismiss ALL browser dialogs (alert, confirm, prompt, beforeunload) ──
         page.on("dialog", lambda d: asyncio.ensure_future(_auto_dismiss(d, email)))
 
-        # ── Intercept private network requests ──
-        await page.route("**/*", _block_private)
+        # Chrome flags (above) already handle private network access blocking.
+        # No need for page.route() — intercepting every request adds latency
+        # that breaks Google's timing-sensitive OAuth redirect chain.
 
         page.set_default_timeout(30000)
 
@@ -235,7 +407,7 @@ async def automate_login(email, password, nonce, code_challenge, machine_id):
 
         try:
             await page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
             url = page.url
             log(f"[{email}] Page: {url[:80]}...")
 
@@ -307,10 +479,11 @@ async def automate_login(email, password, nonce, code_challenge, machine_id):
 async def _handle_signin_page(page, email, password):
     """Returns True if Google SSO was found and clicked, False otherwise."""
     log(f"[{email}] Detecting login method...")
-    # Wait longer for page render (headless can be slower)
-    await asyncio.sleep(3)
 
-    # Retry Google SSO detection multiple times (headless may need more time)
+    # Let the page render. Qoder uses persistent connections (analytics etc.)
+    # so networkidle may never fire. Use domcontentloaded + generous wait.
+    await asyncio.sleep(4)
+
     for attempt in range(5):
         if attempt > 0:
             dbg(f"[{email}] Google SSO retry #{attempt+1}...")
@@ -321,19 +494,24 @@ async def _handle_signin_page(page, email, password):
             await _handle_google_login(page, email, password)
             return True
 
-    # Qoder ONLY supports Google SSO — no direct email/password fallback
+        # Early bailout: if page navigated away from sign-in, stop retrying
+        try:
+            current_url = page.url
+            if "sign-in" not in current_url and "users" not in current_url:
+                log(f"[{email}] Page navigated away during SSO detection: {current_url[:80]}", "OK")
+                return True
+        except:
+            pass
+
     log(f"[{email}] Google SSO button NOT found after 5 attempts!", "ERR")
     log(f"[{email}] Qoder only supports Google SSO login.", "ERR")
-    # Try to get page info for debugging
     try:
         title = await page.title()
         url = page.url
         dbg(f"[{email}] Page title: {title}, URL: {url[:100]}")
-        # Screenshot for debugging headless issues
-        if HEADLESS:
-            ss_path = f"debug_sso_{email.split('@')[0]}.png"
-            await page.screenshot(path=ss_path)
-            dbg(f"[{email}] Debug screenshot saved: {ss_path}")
+        ss_path = f"debug_sso_{email.split('@')[0]}.png"
+        await page.screenshot(path=ss_path)
+        dbg(f"[{email}] Debug screenshot saved: {ss_path}")
     except:
         pass
     return False
@@ -350,34 +528,44 @@ async def _try_google_sso(page):
         'button:has-text("google")', 'a:has-text("google")',
         'span:has-text("Google")', 'span:has-text("google")',
     ]
+    dbg(f"Trying {len(google_selectors)} Google SSO selectors...")
     for sel in google_selectors:
         try:
             el = page.locator(sel).first
-            if await el.is_visible(timeout=2000):
+            if await el.is_visible(timeout=500):
                 await el.click(force=True)
-                dbg(f"Google SSO clicked via: {sel}")
-                await asyncio.sleep(3)
-                return True
+                dbg(f"Clicked {sel}, polling for Google navigation...")
+                # Poll window.location.href instead of wait_for_url
+                for i in range(15):
+                    await asyncio.sleep(1)
+                    try:
+                        current_url = await page.evaluate("window.location.href")
+                        if "accounts.google.com" in current_url:
+                            dbg("Arrived at Google login page")
+                            return True
+                        if "sunra.ai" in current_url or "selectAccounts" in current_url:
+                            dbg(f"Redirected directly to: {current_url[:80]}")
+                            return True
+                    except:
+                        pass
+                dbg("Google redirect did not happen after click")
         except:
             continue
-    # JS fallback — search all clickable elements for "google" text
+
+    dbg("All selectors exhausted, trying JS fallback...")
     try:
         clicked = await page.evaluate("""() => {
             const els = document.querySelectorAll(
-                'button, a, div[role="button"], span[role="button"], ' +
-                '[onclick], [class*="btn"], [class*="button"], [class*="social"], ' +
-                '[class*="oauth"], [class*="provider"], [class*="sso"]'
+                'button, a, div[role="button"], span[role="button"]'
             );
             for (const el of els) {
                 const txt = (el.textContent || el.innerText || el.getAttribute('aria-label') || '').toLowerCase();
                 if (txt.includes('google')) {
-                    // Scroll into view first (helps headless)
                     el.scrollIntoView({block: 'center'});
                     el.click();
-                    return 'clicked: ' + (el.tagName + ':' + txt.trim().substring(0, 30));
+                    return 'clicked:' + txt.substring(0, 30);
                 }
             }
-            // Also check images with Google-related alt/src
             const imgs = document.querySelectorAll('img');
             for (const img of imgs) {
                 const alt = (img.alt || '').toLowerCase();
@@ -386,23 +574,39 @@ async def _try_google_sso(page):
                     const parent = img.closest('button, a, [role="button"]') || img;
                     parent.scrollIntoView({block: 'center'});
                     parent.click();
-                    return 'clicked img: ' + alt.substring(0, 30);
+                    return 'clicked-img:' + alt.substring(0, 30);
                 }
             }
             return null;
         }""")
         if clicked:
-            dbg(f"Google SSO JS fallback: {clicked}")
-            await asyncio.sleep(3)
-            return True
+            dbg(f"JS fallback: {clicked}")
+            for i in range(15):
+                await asyncio.sleep(1)
+                try:
+                    current_url = await page.evaluate("window.location.href")
+                    if "accounts.google.com" in current_url:
+                        dbg("Arrived at Google (JS fallback)")
+                        return True
+                except:
+                    pass
     except:
         pass
+    dbg("_try_google_sso returning False")
     return False
 
 
 # ── Google Login ──────────────────────────────────────────────────────
 async def _handle_google_login(page, email, password):
     log(f"[{email}] On Google login page. Automating...")
+
+    # Re-inject stealth on Google pages after each navigation
+    _REINJECT_STEALTH = """
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en', 'id'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        window.chrome = { runtime: {}, app: {} };
+    """
 
     for attempt in range(90):
         try:
@@ -413,6 +617,78 @@ async def _handle_google_login(page, email, password):
 
         if "accounts.google.com" not in url and "accounts.google.co" not in url:
             log(f"[{email}] Left Google. Now at: {url[:60]}", "OK")
+            return
+
+        # Re-inject stealth every iteration — Google may overwrite on page transitions
+        try:
+            await page.evaluate(_REINJECT_STEALTH)
+        except:
+            pass
+
+        # ── Google security / verification page detection ──
+        # Google may show CAPTCHA, "Verify it's you", "Suspicious activity",
+        # rate-limit, or 2FA pages. Detect and handle them.
+        google_block_state = None
+        try:
+            google_block_state = await page.evaluate("""() => {
+                const body = (document.body ? document.body.innerText : '') + ' ' + document.title;
+
+                // Rate limiting / "try again later"
+                if (body.includes('try again later') || body.includes('coba lagi nanti') ||
+                    body.includes('too many') || body.includes('terlalu banyak') ||
+                    body.includes('rate limit') || body.includes('quota exceeded')) {
+                    return 'RATE_LIMIT';
+                }
+                // CAPTCHA
+                if (document.querySelector('iframe[src*="recaptcha"], iframe[src*="captcha"], ' +
+                    '[class*="captcha"], #captcha, form[action*="challenge"]')) {
+                    return 'CAPTCHA';
+                }
+                // "Verify it's you" / challenge page
+                if (body.includes('verify it') || body.includes('verifikasi') ||
+                    body.includes('confirm it') || body.includes('checking your') ||
+                    body.includes('unusual traffic') || body.includes('lalu lintas tidak biasa') ||
+                    document.querySelector('[data-challenge]')) {
+                    return 'VERIFY';
+                }
+                // 2FA / recovery
+                if (body.includes('2-step verification') || body.includes('verifikasi 2 langkah') ||
+                    body.includes('recovery phone') || body.includes('recovery email') ||
+                    body.includes('authenticator') || body.includes('get a verification code') ||
+                    body.includes('verification code') || body.includes('kode verifikasi') ||
+                    document.querySelector('input[type="tel"], input[placeholder*="G-"')) {
+                    return '2FA';
+                }
+                // Password changed / suspicious
+                if (body.includes('password was changed') || body.includes('kata sandi diubah') ||
+                    body.includes('suspicious') || body.includes('mencurigakan') ||
+                    body.includes('recovery')) {
+                    return 'SUSPICIOUS';
+                }
+                return null;
+            }""")
+        except:
+            google_block_state = None
+
+        if google_block_state:
+            log(f"[{email}] Google security page detected: {google_block_state}", "ERR")
+            if google_block_state == "RATE_LIMIT":
+                log(f"[{email}] Google is rate-limiting. Try: wait 5-10min, reduce --concurrent, use different IP", "ERR")
+            elif google_block_state == "CAPTCHA":
+                log(f"[{email}] Google CAPTCHA detected! Cannot auto-solve. Use --headless=false for manual solve", "ERR")
+            elif google_block_state == "VERIFY":
+                log(f"[{email}] Google 'Verify it's you' page. May need manual intervention", "ERR")
+            elif google_block_state == "2FA":
+                log(f"[{email}] Google 2FA required! Disable 2FA on this account or use app password", "ERR")
+            elif google_block_state == "SUSPICIOUS":
+                log(f"[{email}] Google flagged account as suspicious. Check manually", "ERR")
+            # Save screenshot for debugging
+            try:
+                ss_path = f"debug_google_{google_block_state}_{email.split('@')[0]}.png"
+                await page.screenshot(path=ss_path)
+                dbg(f"[{email}] Screenshot saved: {ss_path}")
+            except:
+                pass
             return
 
         # ── Email step ──
@@ -671,115 +947,91 @@ async def _handle_qoder_password_login(page, email, password):
 # ── Select Accounts page ──────────────────────────────────────────────
 async def _handle_select_accounts(page, email=""):
     """Handle the Qoder selectAccounts page with retry + diagnostics.
-    
+
     This page appears after Google SSO succeeds. We need to click the right
     element to complete the OAuth authorization server-side. If we fail here,
     the device token poll will never receive a token.
     """
     log(f"[{email}] Handling selectAccounts page...", "WAIT")
+    await asyncio.sleep(2)
 
-    for attempt in range(3):
-        if attempt > 0:
-            log(f"[{email}] selectAccounts retry #{attempt+1}...", "WAIT")
-            await asyncio.sleep(2)
+    try:
+        result = await page.evaluate("""() => {
+            const info = { clicked: false, method: '', isSuccess: false };
+            const bodyText = document.body ? document.body.innerText : '';
 
-        # Wait for page to settle
-        await asyncio.sleep(2)
-
-        try:
-            result = await page.evaluate("""() => {
-                const info = { clicked: false, method: '', buttons: [], allText: '' };
-
-                // Collect all visible button/link text for diagnostics
-                const allClickable = document.querySelectorAll(
-                    'button, a, [role="button"], [role="link"], input[type="submit"]'
-                );
-                info.buttons = Array.from(allClickable).slice(0, 20).map(el => ({
-                    tag: el.tagName,
-                    text: (el.textContent || el.value || '').trim().substring(0, 60),
-                    visible: el.offsetParent !== null,
-                    classes: (el.className || '').substring(0, 80),
-                }));
-                info.allText = document.body ? document.body.innerText.substring(0, 500) : '';
-
-                // ── Strategy 1: Known action keywords (original + expanded) ──
-                const actionTexts = [
-                    'select', 'continue', 'authorize', 'confirm', 'allow',
-                    'grant', 'approve', 'accept', 'sign in', 'log in',
-                    'get started', 'proceed', 'next', 'ok',
-                    // Indonesian
-                    'pilih', 'lanjutkan', 'setujui', 'izinkan', 'konfirmasi',
-                ];
-                for (const btn of allClickable) {
-                    if (btn.offsetParent === null) continue;
-                    const t = (btn.textContent || btn.value || '').toLowerCase().trim();
-                    if (actionTexts.some(kw => t.includes(kw))) {
-                        btn.click();
-                        info.clicked = true;
-                        info.method = 'action-text: ' + t.substring(0, 50);
-                        return info;
-                    }
-                }
-
-                // ── Strategy 2: Click first account/profile card ──
-                const accountEls = document.querySelectorAll(
-                    '[class*="account"], [class*="user"], [class*="profile"], ' +
-                    '[class*="card"], [class*="item"], [class*="option"]'
-                );
-                for (const el of accountEls) {
-                    if (el.offsetParent === null) continue;
-                    // Make sure it's not just a wrapper — check it has meaningful content
-                    const txt = (el.textContent || '').trim();
-                    if (txt.length > 2 && txt.length < 200) {
-                        el.click();
-                        info.clicked = true;
-                        info.method = 'account-card: ' + txt.substring(0, 50);
-                        return info;
-                    }
-                }
-
-                // ── Strategy 3: Any visible button (last resort) ──
-                for (const btn of allClickable) {
-                    if (btn.offsetParent === null) continue;
-                    const t = (btn.textContent || btn.value || '').trim();
-                    if (t.length > 0) {
-                        btn.click();
-                        info.clicked = true;
-                        info.method = 'first-visible-btn: ' + t.substring(0, 50);
-                        return info;
-                    }
-                }
-
+            // If this is a "Sign in success" confirmation page, no action needed
+            if (bodyText.includes('Sign in success') || bodyText.includes('success')) {
+                info.isSuccess = true;
                 return info;
-            }""")
-        except Exception as e:
-            log(f"[{email}] selectAccounts JS error: {e}", "ERR")
-            continue
+            }
 
-        if result and result.get("clicked"):
-            log(f"[{email}] selectAccounts: {result['method']}", "OK")
-            # Wait for page to navigate/process after click
-            await asyncio.sleep(3)
-            return True
+            const allClickable = document.querySelectorAll(
+                'button, a, [role="button"], [role="link"], input[type="submit"]'
+            );
+            const actionTexts = [
+                'select', 'continue', 'authorize', 'confirm', 'allow',
+                'grant', 'approve', 'accept', 'sign in', 'log in',
+                'get started', 'proceed', 'next', 'ok',
+                'pilih', 'lanjutkan', 'setujui', 'izinkan', 'konfirmasi',
+            ];
+            for (const btn of allClickable) {
+                if (btn.offsetParent === null) continue;
+                const t = (btn.textContent || btn.value || '').toLowerCase().trim();
+                if (actionTexts.some(kw => t.includes(kw))) {
+                    btn.click();
+                    info.clicked = true;
+                    info.method = 'action-text: ' + t.substring(0, 50);
+                    return info;
+                }
+            }
+            const accountEls = document.querySelectorAll(
+                '[class*="account"], [class*="user"], [class*="profile"], ' +
+                '[class*="card"], [class*="item"], [class*="option"]'
+            );
+            for (const el of accountEls) {
+                if (el.offsetParent === null) continue;
+                const txt = (el.textContent || '').trim();
+                if (txt.length > 2 && txt.length < 200) {
+                    el.click();
+                    info.clicked = true;
+                    info.method = 'account-card: ' + txt.substring(0, 50);
+                    return info;
+                }
+            }
+            for (const btn of allClickable) {
+                if (btn.offsetParent === null) continue;
+                const t = (btn.textContent || btn.value || '').trim();
+                if (t.length > 0) {
+                    btn.click();
+                    info.clicked = true;
+                    info.method = 'first-visible-btn: ' + t.substring(0, 50);
+                    return info;
+                }
+            }
+            return info;
+        }""")
+    except Exception as e:
+        log(f"[{email}] selectAccounts JS error: {e}", "ERR")
+        return True  # Don't block on JS errors
 
-        # Not clicked — log diagnostics for debugging
-        if result:
-            btn_summary = [f"{b['tag']}:'{b['text'][:30]}'" for b in (result.get('buttons') or []) if b.get('visible')][:8]
-            log(f"[{email}] selectAccounts: no matching button found (attempt {attempt+1}/3)", "ERR")
-            log(f"[{email}] Visible buttons: {btn_summary}", "ERR")
-            dbg(f"[{email}] Page text: {(result.get('allText') or '')[:200]}")
+    if result and result.get("isSuccess"):
+        log(f"[{email}] selectAccounts: success confirmation page (no action needed)", "OK")
+        return True
 
-        # Screenshot for debugging (always save, not just headless)
-        try:
-            ss_path = f"debug_selectAccounts_{email.split('@')[0]}_a{attempt+1}.png"
-            await page.screenshot(path=ss_path)
-            log(f"[{email}] Screenshot saved: {ss_path}", "DBG" if attempt < 2 else "ERR")
-        except:
-            pass
+    if result and result.get("clicked"):
+        log(f"[{email}] selectAccounts: {result['method']}", "OK")
+        await asyncio.sleep(3)
+        return True
 
-    log(f"[{email}] selectAccounts: FAILED after 3 attempts — token may not be issued!", "ERR")
-    log(f"[{email}] Check the debug_selectAccounts_*.png screenshots for clues.", "ERR")
-    return False
+    log(f"[{email}] selectAccounts: no matching action found — token may still arrive", "WAIT")
+    try:
+        ss_path = f"debug_selectAccounts_{email.split('@')[0]}.png"
+        await page.screenshot(path=ss_path)
+        dbg(f"[{email}] Screenshot saved: {ss_path}")
+    except:
+        pass
+    return True  # Don't block; token poll will handle timeout if needed
 
 
 # ── Page error extractor ──────────────────────────────────────────────

@@ -1280,25 +1280,69 @@ async def async_main():
     start = time.time()
     results = await run_batch(accounts, test_only=args.test, concurrent=args.concurrent)
 
-    # Summary
-    total_time = time.time() - start
-    ok = sum(1 for r in results if r.get("success"))
-    fail = len(results) - ok
+    # ── Retry loop for failed accounts ──
+    max_retries = 3
+    retry_count = 0
 
-    log(f"\n{'='*60}", "SUM")
-    log(f"SUMMARY: {ok}✅ {fail}❌ | Total: {total_time:.1f}s | Avg: {total_time/max(len(results),1):.1f}s/account", "SUM")
-    log(f"{'='*60}", "SUM")
-    for r in results:
-        s = "✅" if r.get("success") else "❌"
-        e = r.get("error", "")
-        t = f" ({r['elapsed']}s)" if r.get("elapsed") else ""
-        n = f" → {r.get('displayName','')}" if r.get("displayName") and r.get("success") else ""
-        log(f"  {s} {r['email']}{n}{t}{' — '+e if e else ''}", "SUM")
+    while True:
+        # Summary
+        total_time = time.time() - start
+        ok = sum(1 for r in results if r.get("success"))
+        fail = len(results) - ok
 
-    if ok == len(results):
-        log(f"\n🎉 All {ok} accounts processed successfully!", "OK")
-    else:
-        log(f"\n⚠️  {fail} account(s) failed. Check logs above.", "ERR")
+        log(f"\n{'='*60}", "SUM")
+        log(f"SUMMARY: {ok}✅ {fail}❌ | Total: {total_time:.1f}s | Avg: {total_time/max(len(results),1):.1f}s/account", "SUM")
+        log(f"{'='*60}", "SUM")
+        for r in results:
+            s = "✅" if r.get("success") else "❌"
+            e = r.get("error", "")
+            t = f" ({r['elapsed']}s)" if r.get("elapsed") else ""
+            n = f" → {r.get('displayName','')}" if r.get("displayName") and r.get("success") else ""
+            log(f"  {s} {r['email']}{n}{t}{' — '+e if e else ''}", "SUM")
+
+        if ok == len(results):
+            log(f"\n🎉 All {ok} accounts processed successfully!", "OK")
+            break
+
+        # Failed accounts exist
+        failed = [r for r in results if not r.get("success")]
+        log(f"\n⚠️  {len(failed)} account(s) failed:", "ERR")
+        for r in failed:
+            log(f"  ❌ {r['email']} — {r.get('error', 'unknown')}", "ERR")
+
+        # Ask to retry
+        retry_count += 1
+        if retry_count > max_retries:
+            log(f"\nMax retries ({max_retries}) reached. Stopping.", "ERR")
+            break
+
+        try:
+            print()
+            answer = input(f"  Retry {len(failed)} failed account(s)? (attempt {retry_count}/{max_retries}) [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+        if answer != "y":
+            log("Skipping retry.", "INFO")
+            break
+
+        # Collect failed accounts as "email:password" pairs
+        # We need to look up passwords from the original accounts list
+        failed_accounts = []
+        failed_emails = {r["email"].lower() for r in failed}
+        for acc in accounts:
+            email = acc.split(":", 1)[0]
+            if email.lower() in failed_emails:
+                failed_accounts.append(acc)
+
+        if not failed_accounts:
+            log("No failed accounts to retry.", "ERR")
+            break
+
+        log(f"\n🔄 Retrying {len(failed_accounts)} account(s)...", "WAIT")
+        results = await run_batch(failed_accounts, test_only=args.test, concurrent=args.concurrent)
+        accounts = failed_accounts  # Update for potential next retry
 
 
 def main():

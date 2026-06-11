@@ -11,4 +11,7 @@ echo.
 python "%~dp0qoder_autologin.py" --batch "%~dp0accounts.txt" --interactive %*
 
 echo.
-pause
+echo  Script finished. Window will stay open — close it manually.
+echo.
+cmd /k
+

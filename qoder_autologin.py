@@ -1052,7 +1052,96 @@ Account format (in file):
                         help="Interactive mode: show info and ask before running")
     parser.add_argument("--no-skip-existing", action="store_true",
                         help="Re-login even if account already exists in 9router")
+    parser.add_argument("--no-update", action="store_true",
+                        help="Skip auto-update check")
     return parser.parse_args()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Auto-update from Git
+# ══════════════════════════════════════════════════════════════════════
+REPO_URL = "https://github.com/andreanocalvin/qoder-autologin.git"
+
+def check_for_updates():
+    """Check for updates from the repo. Ask user before pulling."""
+    import subprocess
+
+    # Find script directory (where .git should be)
+    script_dir = Path(__file__).parent.resolve()
+    git_dir = script_dir / ".git"
+
+    if not git_dir.exists():
+        dbg("No .git directory found — skipping auto-update")
+        return
+
+    def _git(*args):
+        try:
+            r = subprocess.run(
+                ["git"] + list(args),
+                capture_output=True, text=True, timeout=15,
+                cwd=str(script_dir),
+            )
+            return r.stdout.strip(), r.returncode
+        except Exception as e:
+            dbg(f"git {' '.join(args)} error: {e}")
+            return "", 1
+
+    # 1. Fetch latest from remote
+    log("Checking for updates...", "WAIT")
+    _, rc = _git("fetch", "origin", "main", "--quiet")
+    if rc != 0:
+        log("Could not reach remote repo — skipping update check", "ERR")
+        return
+
+    # 2. Check for new commits
+    new_commits, rc = _git("log", "HEAD..origin/main", "--oneline")
+    if rc != 0 or not new_commits:
+        log("Already up to date! ✅", "OK")
+        return
+
+    # 3. Count and show new commits
+    commit_lines = new_commits.strip().split("\n")
+    num_commits = len(commit_lines)
+
+    print()
+    print("  ╔══════════════════════════════════════════════╗")
+    print(f"  ║  🔄 Update available! ({num_commits} new commit{'s' if num_commits > 1 else ''})         ║")
+    print("  ╠══════════════════════════════════════════════╣")
+    for line in commit_lines[:5]:  # Show max 5 commits
+        # Truncate long lines
+        display = line[:44] if len(line) > 44 else line
+        print(f"  ║  {display:<44}║")
+    if num_commits > 5:
+        print(f"  ║  ... and {num_commits - 5} more{' ' * 30}║")
+    print("  ╚══════════════════════════════════════════════╝")
+    print()
+
+    # 4. Ask user
+    try:
+        answer = input("  Update now? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if answer == "n":
+        log("Skipped update. Continuing with current version...", "INFO")
+        return
+
+    # 5. Pull
+    log("Pulling latest changes...", "WAIT")
+    output, rc = _git("pull", "origin", "main")
+    if rc != 0:
+        log(f"Git pull failed: {output}", "ERR")
+        return
+
+    # 6. Success — show what changed
+    log(f"Updated! ({num_commits} commits pulled)", "OK")
+    print()
+
+    # 7. Re-exec the script with same arguments so new code takes effect
+    log("Restarting with updated code...", "WAIT")
+    python = sys.executable
+    os.execv(python, [python] + sys.argv)
 
 
 async def async_main():
@@ -1061,6 +1150,10 @@ async def async_main():
     args = parse_args()
     HEADLESS = args.headless
     DEBUG_ENABLED = args.debug
+
+    # ── Auto-update check (before anything else) ──
+    if not args.no_update:
+        check_for_updates()
 
     # Override minimum version if specified
     min_ver = args.min_version

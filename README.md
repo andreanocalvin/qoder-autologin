@@ -9,6 +9,8 @@ Reverse-engineered dari 9router v0.4.71.
 - **Batch mode** — login banyak akun sekaligus dari file
 - **Concurrent processing** — beberapa browser jalan bareng (1-5)
 - **Headless mode** — browser invisible untuk automation
+- **Auto-update** — cek update otomatis dari repo, tanya sebelum pull
+- **Retry failed** — akun yang gagal bisa langsung di-retry (max 3x)
 - **Skip existing** — auto-skip akun yang sudah ada di 9router DB
 - **Consent handler** — otomatis handle semua Google agreement screens:
   - "Saya mengerti" / "I understand"
@@ -34,7 +36,8 @@ Reverse-engineered dari 9router v0.4.71.
 ### 1. Install
 
 ```bash
-# Clone atau download repo ini, lalu:
+# Clone repo
+git clone https://github.com/andreanocalvin/qoder-autologin.git
 cd qoder-autologin
 
 # Auto-install dependencies
@@ -119,7 +122,7 @@ email3@workspace.com:password3
 usage: qoder_autologin.py [-h] [--batch FILE] [--headless]
                           [--concurrent N] [--test] [--debug]
                           [--min-version VER] [--interactive]
-                          [--no-skip-existing]
+                          [--no-skip-existing] [--no-update]
                           [accounts ...]
 
 positional arguments:
@@ -134,7 +137,55 @@ options:
   --min-version VER     Minimum 9router version (default: 0.4.71)
   -i, --interactive     Interactive prompts before running
   --no-skip-existing    Re-login even if account exists in 9router
+  --no-update           Skip auto-update check
 ```
+
+## 🔄 Auto-Update
+
+Setiap kali script dijalankan, otomatis cek update dari repo:
+
+```
+[13:10:27] ⏳ Checking for updates...
+
+  ╔══════════════════════════════════════════════╗
+  ║  🔄 Update available! (2 new commits)         ║
+  ╠══════════════════════════════════════════════╣
+  ║  3b1a951 feat: auto-update check              ║
+  ║  6608d26 perf: optimize login speed           ║
+  ╚══════════════════════════════════════════════╝
+
+  Update now? [Y/n]: y
+```
+
+- Jawab **Y** → pull + restart otomatis dengan code baru
+- Jawab **n** → skip, lanjut pakai versi sekarang
+- Pakai `--no-update` untuk skip cek sama sekali
+
+## 🔁 Retry Failed Accounts
+
+Kalau ada akun yang gagal di akhir batch, script tanya mau retry:
+
+```
+📊 SUMMARY: 6✅ 2❌ | Total: 192.0s | Avg: 24.0s/account
+============================================================
+  ✅ email1@gmail.com → JohnDoe (24s)
+  ✅ email2@gmail.com → JaneSmith (25s)
+  ...
+  ❌ email7@gmail.com — Timeout 30000ms exceeded.
+  ❌ email8@gmail.com — navigation interrupted
+
+⚠️  2 account(s) failed:
+  ❌ email7@gmail.com — Timeout 30000ms exceeded.
+  ❌ email8@gmail.com — navigation interrupted
+
+  Retry 2 failed account(s)? (attempt 1/3) [y/N]: y
+
+🔄 Retrying 2 account(s)...
+```
+
+- Max **3 retry attempts** per batch
+- Hanya ulang akun yang gagal (bukan semua)
+- Jawab **n** atau Enter untuk skip
 
 ## 🛡️ Safety Features
 
@@ -153,22 +204,14 @@ Script akan **block** kalau 9router versi terlalu lama:
 ### Test Mode
 `--test` flag: jalankan login tanpa save ke DB. Berguna untuk testing akun baru.
 
-## 🔄 Transfer ke Device Lain
-
-1. Zip folder `qoder-autologin`
-2. Kirim ke device baru
-3. Jalankan `setup.bat`
-4. Isi `accounts.txt`
-5. Double-click `run-batch.bat`
-
 ## ⚡ Performance
 
-| Mode | Per Account | 10 Accounts |
-|------|------------|-------------|
-| Visible, concurrent=1 | ~35s | ~6 min |
-| Headless, concurrent=1 | ~30s | ~5 min |
-| Visible, concurrent=3 | ~35s each | ~2 min |
-| Headless, concurrent=3 | ~30s each | ~1.5 min |
+| Mode | Per Account | 10 Accounts | 50 Accounts |
+|------|------------|-------------|-------------|
+| Visible, concurrent=1 | ~24s | ~4 min | ~20 min |
+| Headless, concurrent=1 | ~22s | ~3.5 min | ~18 min |
+| Visible, concurrent=3 | ~24s each | ~1.5 min | ~7 min |
+| Headless, concurrent=3 | ~22s each | ~1.2 min | ~6 min |
 
 > ⚠️ Concurrent > 2 bisa trigger Google rate-limiting. Recommended: **concurrent 1-2**.
 
@@ -189,6 +232,10 @@ Script akan **block** kalau 9router versi terlalu lama:
 **Consent screen stuck:**
 - Script auto-handle kebanyakan consent screen
 - Kalau ada yang baru, submit issue dengan screenshot
+
+**Loading lambat di Playwright:**
+- Normal — Playwright lebih lambat 2-5 detik dari Chrome biasa
+- Kalau stuck banget, kemungkinan internet atau Google SSO server lagi down
 
 ## 📄 License
 

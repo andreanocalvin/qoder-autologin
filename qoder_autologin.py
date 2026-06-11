@@ -60,6 +60,36 @@ def dbg(msg):
     if DEBUG_ENABLED: log(msg, "DBG")
 
 
+def _short_error(err):
+    """Truncate long Playwright/browser errors to a one-liner."""
+    if not err:
+        return ""
+    err = str(err)
+
+    # Known patterns → short labels
+    patterns = [
+        ("token_timeout", "token timeout"),
+        ("google_sso_not_found", "Google SSO not found"),
+        ("db_save_failed", "DB save failed"),
+        ("Execution context was destroyed", "navigation interrupted"),
+        ("Target page, context or browser has been closed", "browser closed"),
+        ("Navigation timeout", "navigation timeout"),
+    ]
+    for pattern, label in patterns:
+        if pattern in err:
+            return label
+
+    # Playwright timeout — extract first line
+    if "Timeout" in err and "exceeded" in err:
+        first_line = err.split("\n")[0].strip()
+        # "Locator.press: Timeout 30000ms exceeded."
+        return first_line
+
+    # Generic: take first line, max 80 chars
+    first_line = err.split("\n")[0].strip()
+    return first_line[:80] + ("..." if len(first_line) > 80 else "")
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  PKCE / helpers
 # ══════════════════════════════════════════════════════════════════════
@@ -1295,7 +1325,7 @@ async def async_main():
         log(f"{'='*60}", "SUM")
         for r in results:
             s = "✅" if r.get("success") else "❌"
-            e = r.get("error", "")
+            e = _short_error(r.get("error", ""))
             t = f" ({r['elapsed']}s)" if r.get("elapsed") else ""
             n = f" → {r.get('displayName','')}" if r.get("displayName") and r.get("success") else ""
             log(f"  {s} {r['email']}{n}{t}{' — '+e if e else ''}", "SUM")
@@ -1308,7 +1338,7 @@ async def async_main():
         failed = [r for r in results if not r.get("success")]
         log(f"\n⚠️  {len(failed)} account(s) failed:", "ERR")
         for r in failed:
-            log(f"  ❌ {r['email']} — {r.get('error', 'unknown')}", "ERR")
+            log(f"  ❌ {r['email']} — {_short_error(r.get('error', 'unknown'))}", "ERR")
 
         # Ask to retry
         retry_count += 1

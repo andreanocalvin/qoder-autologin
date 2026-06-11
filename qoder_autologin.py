@@ -141,12 +141,18 @@ async def poll_device_token(nonce, verifier, timeout_sec=180, email=""):
                         dbg(f"[{email}] Poll #{poll_count}: status={r.status}")
             except Exception as e:
                 dbg(f"[{email}] Poll #{poll_count} err: {e}")
-            # Periodic INFO log every ~30s so user knows polling is alive
-            if poll_count % 10 == 0:
+            
+            # Aggressive polling: 1s for first 20 attempts, then 2s after
+            if poll_count < 20:
+                await asyncio.sleep(1)
+            else:
+                await asyncio.sleep(2)
+            
+            # Periodic INFO log every ~20s so user knows polling is alive
+            if poll_count % 15 == 0:
                 elapsed = time.time() - start
                 remaining = timeout_sec - elapsed
                 log(f"[{email}] Still polling... ({poll_count} attempts, {elapsed:.0f}s elapsed, {remaining:.0f}s remaining)", "WAIT")
-            await asyncio.sleep(3)
     log(f"[{email}] Poll timeout after {poll_count} attempts ({timeout_sec}s)", "ERR")
     return None
 
@@ -277,21 +283,9 @@ async def automate_login(email, password, nonce, code_challenge, machine_id):
                 log(f"[{email}] Unexpected page: {url}", "ERR")
 
             if state["login_done"]:
-                log(f"[{email}] Login flow complete. Waiting for server confirmation...", "WAIT")
-                # Give server a few seconds to process the authorization before closing browser
-                try:
-                    prev_url = page.url
-                    for _wait in range(10):
-                        await asyncio.sleep(1)
-                        cur_url = page.url
-                        if cur_url != prev_url:
-                            log(f"[{email}] Post-auth redirect: {cur_url[:80]}", "OK")
-                            break
-                    else:
-                        dbg(f"[{email}] No post-auth redirect after 10s (may still work)")
-                except:
-                    pass
-                log(f"[{email}] Closing browser...", "WAIT")
+                log(f"[{email}] Login flow complete. Closing browser...", "WAIT")
+                # Brief wait for server to process authorization (no need to wait long)
+                await asyncio.sleep(1)
 
         except Exception as e:
             log(f"[{email}] Browser error: {e}", "ERR")
@@ -307,14 +301,14 @@ async def automate_login(email, password, nonce, code_challenge, machine_id):
 async def _handle_signin_page(page, email, password):
     """Returns True if Google SSO was found and clicked, False otherwise."""
     log(f"[{email}] Detecting login method...")
-    # Wait longer for page render (headless can be slower)
-    await asyncio.sleep(3)
+    # Brief wait for page render (shorter for visible mode)
+    await asyncio.sleep(1 if not HEADLESS else 2)
 
     # Retry Google SSO detection multiple times (headless may need more time)
     for attempt in range(5):
         if attempt > 0:
             dbg(f"[{email}] Google SSO retry #{attempt+1}...")
-            await asyncio.sleep(2)
+            await asyncio.sleep(1 if not HEADLESS else 2)
 
         if await _try_google_sso(page):
             log(f"[{email}] Google SSO detected. Handling Google login...", "OK")
@@ -353,10 +347,11 @@ async def _try_google_sso(page):
     for sel in google_selectors:
         try:
             el = page.locator(sel).first
-            if await el.is_visible(timeout=2000):
+            if await el.is_visible(timeout=1000):
                 await el.click(force=True)
                 dbg(f"Google SSO clicked via: {sel}")
-                await asyncio.sleep(3)
+                # Shorter wait for visible mode, longer for headless
+                await asyncio.sleep(1.5 if not HEADLESS else 2.5)
                 return True
         except:
             continue
@@ -433,13 +428,28 @@ async def _handle_google_login(page, email, password):
             await asyncio.sleep(0.2)
             await loc.press("Control+a")
             await loc.press("Backspace")
-            await loc.press_sequentially(email, delay=50)
+            await loc.press_sequentially(email, delay=40)
             await asyncio.sleep(0.3)
             await page.evaluate("""() => {
                 const btn = document.querySelector('#identifierNext button');
                 if (btn) btn.click();
             }""")
-            await asyncio.sleep(2.5)
+            # Wait for password field to appear (confirms email step passed)
+            for _w in range(10):
+                await asyncio.sleep(0.5)
+                try:
+                    pwd_check = await page.evaluate("""() => {
+                        for (const el of document.querySelectorAll(
+                                'input[name="Passwd"], input[type="password"]')) {
+                            if (el.offsetParent !== null) return true;
+                        }
+                        return false;
+                    }""")
+                    if pwd_check:
+                        break
+                except:
+                    pass
+            await asyncio.sleep(0.5)
             continue
 
         # ── Password step ──
@@ -468,8 +478,8 @@ async def _handle_google_login(page, email, password):
             await asyncio.sleep(0.2)
             await loc.press("Control+a")
             await loc.press("Backspace")
-            await loc.press_sequentially(password, delay=60)
-            await asyncio.sleep(0.3)
+            await loc.press_sequentially(password, delay=30)
+            await asyncio.sleep(0.2)
             await page.evaluate("""() => {
                 const btn = document.querySelector('#passwordNext button');
                 if (btn) btn.click();
@@ -478,7 +488,7 @@ async def _handle_google_login(page, email, password):
                 await page.wait_for_load_state("domcontentloaded", timeout=10000)
             except:
                 pass
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
             continue
 
         # ── Consent / Agreement / Speedbump screens ──
@@ -540,7 +550,7 @@ async def _handle_google_login(page, email, password):
 
         if consent_clicked:
             dbg(f"[{email}] Consent: {consent_clicked}")
-            await asyncio.sleep(2)
+            await asyncio.sleep(1.5)
             if "advanced" in str(consent_clicked):
                 await asyncio.sleep(1)
                 try:
@@ -672,10 +682,31 @@ async def _handle_qoder_password_login(page, email, password):
 async def _handle_select_accounts(page, email=""):
     """Handle the Qoder selectAccounts page with retry + diagnostics.
     
-    This page appears after Google SSO succeeds. We need to click the right
-    element to complete the OAuth authorization server-side. If we fail here,
-    the device token poll will never receive a token.
+    This page appears after Google SSO succeeds. In most cases, the authorization
+    is automatic and the page just shows "Sign in success" / "You're all set!"
+    with no buttons to click. We detect this and return immediately.
     """
+    # Wait for page to settle
+    await asyncio.sleep(1)
+
+    # ── Quick check: is this already a success page? (no action needed) ──
+    try:
+        page_text = await page.evaluate("() => document.body ? document.body.innerText.substring(0, 500) : ''")
+    except:
+        page_text = ""
+    
+    success_indicators = [
+        "sign in success", "you're all set", "all set!",
+        "begin your ai coding", "return to qoder",
+        "successfully signed in", "login successful",
+        "authorized successfully",
+    ]
+    page_text_lower = page_text.lower()
+    
+    if any(indicator in page_text_lower for indicator in success_indicators):
+        log(f"[{email}] selectAccounts: Already authorized! (success page detected)", "OK")
+        return True
+
     log(f"[{email}] Handling selectAccounts page...", "WAIT")
 
     for attempt in range(3):
@@ -905,8 +936,16 @@ async def process_account(email, password, test_only=False):
         poll_task.cancel()
         return {"success": False, "email": email, "error": result["error"]}
 
-    log(f"[{email}] Waiting for device token...", "WAIT")
-    token_data = await poll_task
+    # Check if token already ready (fast path)
+    if poll_task.done():
+        token_data = poll_task.result()
+        if token_data and token_data.get("token"):
+            log(f"[{email}] Token already ready!", "OK")
+        else:
+            log(f"[{email}] Waiting for device token...", "WAIT")
+    else:
+        log(f"[{email}] Waiting for device token...", "WAIT")
+        token_data = await poll_task
 
     if not token_data or not token_data.get("token"):
         log(f"[{email}] Token timeout!", "ERR")

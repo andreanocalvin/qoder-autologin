@@ -141,6 +141,11 @@ async def poll_device_token(nonce, verifier, timeout_sec=180, email=""):
                         dbg(f"[{email}] Poll #{poll_count}: status={r.status}")
             except Exception as e:
                 dbg(f"[{email}] Poll #{poll_count} err: {e}")
+            # Periodic INFO log every ~30s so user knows polling is alive
+            if poll_count % 10 == 0:
+                elapsed = time.time() - start
+                remaining = timeout_sec - elapsed
+                log(f"[{email}] Still polling... ({poll_count} attempts, {elapsed:.0f}s elapsed, {remaining:.0f}s remaining)", "WAIT")
             await asyncio.sleep(3)
     log(f"[{email}] Poll timeout after {poll_count} attempts ({timeout_sec}s)", "ERR")
     return None
@@ -248,7 +253,9 @@ async def automate_login(email, password, nonce, code_challenge, machine_id):
 
                         if "selectAccounts" in url:
                             log(f"[{email}] Redirected to selectAccounts!", "OK")
-                            await _handle_select_accounts(page)
+                            sa_ok = await _handle_select_accounts(page, email)
+                            if not sa_ok:
+                                log(f"[{email}] selectAccounts click may have failed — token might not arrive", "ERR")
                             state["login_done"] = True
                             break
                         if any(x in url for x in ("callback","success","authorized")):
@@ -262,19 +269,35 @@ async def automate_login(email, password, nonce, code_challenge, machine_id):
                                 state["error"] = err
 
             elif "selectAccounts" in url:
-                await _handle_select_accounts(page)
+                sa_ok = await _handle_select_accounts(page, email)
+                if not sa_ok:
+                    log(f"[{email}] selectAccounts click may have failed — token might not arrive", "ERR")
                 state["login_done"] = True
             else:
                 log(f"[{email}] Unexpected page: {url}", "ERR")
 
             if state["login_done"]:
-                log(f"[{email}] Login flow complete. Closing browser...", "WAIT")
+                log(f"[{email}] Login flow complete. Waiting for server confirmation...", "WAIT")
+                # Give server a few seconds to process the authorization before closing browser
+                try:
+                    prev_url = page.url
+                    for _wait in range(10):
+                        await asyncio.sleep(1)
+                        cur_url = page.url
+                        if cur_url != prev_url:
+                            log(f"[{email}] Post-auth redirect: {cur_url[:80]}", "OK")
+                            break
+                    else:
+                        dbg(f"[{email}] No post-auth redirect after 10s (may still work)")
+                except:
+                    pass
+                log(f"[{email}] Closing browser...", "WAIT")
 
         except Exception as e:
             log(f"[{email}] Browser error: {e}", "ERR")
             state["error"] = str(e)
         finally:
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1)
             await browser.close()
 
     return state
@@ -646,29 +669,117 @@ async def _handle_qoder_password_login(page, email, password):
 
 
 # ── Select Accounts page ──────────────────────────────────────────────
-async def _handle_select_accounts(page):
-    dbg("Handling selectAccounts page...")
-    await asyncio.sleep(2)
-    try:
-        clicked = await page.evaluate("""() => {
-            const buttons = document.querySelectorAll('button, a, [role="button"], [class*="account"]');
-            for (const btn of buttons) {
-                const t = (btn.textContent || '').toLowerCase();
-                if (t.includes('select') || t.includes('continue') ||
-                    t.includes('authorize') || t.includes('confirm') ||
-                    t.includes('allow')) {
-                    btn.click(); return 'clicked: ' + t.trim().substring(0, 50);
+async def _handle_select_accounts(page, email=""):
+    """Handle the Qoder selectAccounts page with retry + diagnostics.
+    
+    This page appears after Google SSO succeeds. We need to click the right
+    element to complete the OAuth authorization server-side. If we fail here,
+    the device token poll will never receive a token.
+    """
+    log(f"[{email}] Handling selectAccounts page...", "WAIT")
+
+    for attempt in range(3):
+        if attempt > 0:
+            log(f"[{email}] selectAccounts retry #{attempt+1}...", "WAIT")
+            await asyncio.sleep(2)
+
+        # Wait for page to settle
+        await asyncio.sleep(2)
+
+        try:
+            result = await page.evaluate("""() => {
+                const info = { clicked: false, method: '', buttons: [], allText: '' };
+
+                // Collect all visible button/link text for diagnostics
+                const allClickable = document.querySelectorAll(
+                    'button, a, [role="button"], [role="link"], input[type="submit"]'
+                );
+                info.buttons = Array.from(allClickable).slice(0, 20).map(el => ({
+                    tag: el.tagName,
+                    text: (el.textContent || el.value || '').trim().substring(0, 60),
+                    visible: el.offsetParent !== null,
+                    classes: (el.className || '').substring(0, 80),
+                }));
+                info.allText = document.body ? document.body.innerText.substring(0, 500) : '';
+
+                // ── Strategy 1: Known action keywords (original + expanded) ──
+                const actionTexts = [
+                    'select', 'continue', 'authorize', 'confirm', 'allow',
+                    'grant', 'approve', 'accept', 'sign in', 'log in',
+                    'get started', 'proceed', 'next', 'ok',
+                    // Indonesian
+                    'pilih', 'lanjutkan', 'setujui', 'izinkan', 'konfirmasi',
+                ];
+                for (const btn of allClickable) {
+                    if (btn.offsetParent === null) continue;
+                    const t = (btn.textContent || btn.value || '').toLowerCase().trim();
+                    if (actionTexts.some(kw => t.includes(kw))) {
+                        btn.click();
+                        info.clicked = true;
+                        info.method = 'action-text: ' + t.substring(0, 50);
+                        return info;
+                    }
                 }
-            }
-            const accounts = document.querySelectorAll('[class*="account"], [class*="user"], [class*="profile"]');
-            if (accounts.length > 0) { accounts[0].click(); return 'first account'; }
-            return null;
-        }""")
-        if clicked:
-            dbg(f"Account selection: {clicked}")
-    except:
-        pass
-    await asyncio.sleep(2)
+
+                // ── Strategy 2: Click first account/profile card ──
+                const accountEls = document.querySelectorAll(
+                    '[class*="account"], [class*="user"], [class*="profile"], ' +
+                    '[class*="card"], [class*="item"], [class*="option"]'
+                );
+                for (const el of accountEls) {
+                    if (el.offsetParent === null) continue;
+                    // Make sure it's not just a wrapper — check it has meaningful content
+                    const txt = (el.textContent || '').trim();
+                    if (txt.length > 2 && txt.length < 200) {
+                        el.click();
+                        info.clicked = true;
+                        info.method = 'account-card: ' + txt.substring(0, 50);
+                        return info;
+                    }
+                }
+
+                // ── Strategy 3: Any visible button (last resort) ──
+                for (const btn of allClickable) {
+                    if (btn.offsetParent === null) continue;
+                    const t = (btn.textContent || btn.value || '').trim();
+                    if (t.length > 0) {
+                        btn.click();
+                        info.clicked = true;
+                        info.method = 'first-visible-btn: ' + t.substring(0, 50);
+                        return info;
+                    }
+                }
+
+                return info;
+            }""")
+        except Exception as e:
+            log(f"[{email}] selectAccounts JS error: {e}", "ERR")
+            continue
+
+        if result and result.get("clicked"):
+            log(f"[{email}] selectAccounts: {result['method']}", "OK")
+            # Wait for page to navigate/process after click
+            await asyncio.sleep(3)
+            return True
+
+        # Not clicked — log diagnostics for debugging
+        if result:
+            btn_summary = [f"{b['tag']}:'{b['text'][:30]}'" for b in (result.get('buttons') or []) if b.get('visible')][:8]
+            log(f"[{email}] selectAccounts: no matching button found (attempt {attempt+1}/3)", "ERR")
+            log(f"[{email}] Visible buttons: {btn_summary}", "ERR")
+            dbg(f"[{email}] Page text: {(result.get('allText') or '')[:200]}")
+
+        # Screenshot for debugging (always save, not just headless)
+        try:
+            ss_path = f"debug_selectAccounts_{email.split('@')[0]}_a{attempt+1}.png"
+            await page.screenshot(path=ss_path)
+            log(f"[{email}] Screenshot saved: {ss_path}", "DBG" if attempt < 2 else "ERR")
+        except:
+            pass
+
+    log(f"[{email}] selectAccounts: FAILED after 3 attempts — token may not be issued!", "ERR")
+    log(f"[{email}] Check the debug_selectAccounts_*.png screenshots for clues.", "ERR")
+    return False
 
 
 # ── Page error extractor ──────────────────────────────────────────────

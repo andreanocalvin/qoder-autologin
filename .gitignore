@@ -20,6 +20,7 @@ env/
 # Debug artifacts
 qoder_debug.png
 debug_sso_*.png
+debug_selectAccounts_*.png
 *.log
 
 # Accounts file (contains credentials)
